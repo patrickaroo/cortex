@@ -4,4 +4,6 @@ services:
   - docker
 
 script:
- ./scripts/build-docker-and-test.sh
+  - ./scripts/build-docker-and-test.sh
+#  - 'if [ "$TRAVIS_PULL_REQUEST" = "false" ]; then bash ./scripts/build-codox-and-push.sh ; fi'
+  - ./scripts/build-codox-and-push.sh
