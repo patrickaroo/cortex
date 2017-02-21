@@ -36,7 +36,6 @@ Also, for an example of using cortex in a more real-world scenario please see:
   breakdown of Caffe, Torch, Theano, and TensorFlow.
 
 
-
 ### TODO:
 
  * hdf5 import of major keras models (vgg-net).  This requires each model along with a single input and per-layer outputs for that input.  Please don't ask for anything to be supported unless you can provide the appropriate thorough test.
