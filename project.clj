@@ -4,12 +4,14 @@
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[org.clojure/clojure "1.8.0"]
+                 [org.clojure/core.async "0.3.442"]
 
                  [net.mikera/core.matrix "0.57.0"]
                  [net.mikera/vectorz-clj "0.45.0"]
                  [com.github.fommil.netlib/all "1.1.2" :extension "pom"]
                  [com.indeed/util-mmap "1.0.20"]
                  [com.github.ben-manes.caffeine/caffeine "2.3.1"]
+                 [com.taoensso/timbre "4.8.0"]
                  [com.taoensso/nippy "2.12.2"]
 
                  ;; Change the following dep to depend on different versions of CUDA
@@ -19,7 +21,6 @@
                  ;;The dataset abstraction uses parallel and optionally resource management.
                  [thinktopic/think.parallel "0.3.5"]
                  [thinktopic/think.datatype "0.3.10"]
-
                  [thinktopic/resource "1.1.0"]
                  [thinktopic/think.image "0.4.6"]]
 

@@ -116,17 +116,29 @@
     (map (fn [^long device-index]
            (let [device-ptr (int-array 1)
                  ^"[B" name-buf (make-array Byte/TYPE 512)
+                 total-memory (SizeTPointer. 1)
                  major (int-array 1)
                  minor (int-array 1)
                  multiprocessor-count (int-array 1)
+                 gpu-overlap (int-array 1)
+                 concurrent-kernels (int-array 1)
                  clock-rate (int-array 1)]
              (cuda-call (cuda/cuDeviceGet device-ptr device-index))
              (let [device (aget device-ptr 0)]
                (cuda-call (cuda/cuDeviceGetName name-buf 512 device))
+               (cuda-call (cuda/cuDeviceTotalMem total-memory device))
                (cuda-call (cuda/cuDeviceComputeCapability major minor device))
                (cuda-call (cuda/cuDeviceGetAttribute
                            multiprocessor-count
                            cuda/CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+                           device))
+               (cuda-call (cuda/cuDeviceGetAttribute
+                           concurrent-kernels
+                           cuda/CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS
+                           device))
+               (cuda-call (cuda/cuDeviceGetAttribute
+                           gpu-overlap
+                           cuda/CU_DEVICE_ATTRIBUTE_GPU_OVERLAP
                            device))
                (cuda-call (cuda/cuDeviceGetAttribute
                            clock-rate
@@ -135,7 +147,11 @@
                {:name (zero-term-array-to-string name-buf)
                 :sm-arch { :major (aget major 0) :minor (aget minor 0)}
                 :multiprocessor-count (aget multiprocessor-count 0)
+                :gpu-overlap? (if (zero? (aget gpu-overlap 0)) false true)
+                :concurrent-kernels? (if (zero? (aget concurrent-kernels 0)) false true)
                 :clock-rate (aget clock-rate 0)
+                :total-memory (.get total-memory)
+                :total-memory-gb (Math/round (/ (.get total-memory) 1024.0 1024.0 1024.0))
                 :device-id device})))
          (range (aget dev-count-ary 0)))))
 
@@ -310,11 +326,13 @@ https://devtalk.nvidia.com/default/topic/519087/cuda-context-and-threading/"
                                                  "elementwise_multiply")
                           :l2-constraint-scale (load-float-double-function
                                                 "l2_constraint_scale")
-                          :select (load-float-double-function "select")}]
-    (->CudaDriver :no-selected-device
-                  (atom device-functions)
-                  (blas-context)
-                  (rand-context))))
+                          :select (load-float-double-function "select")}
+        d (->CudaDriver :no-selected-device
+                        (atom device-functions)
+                        (blas-context)
+                        (rand-context))
+        d (drv/set-current-device d (first (list-devices)))]
+    d))
 
 
 (defn get-blas
@@ -834,12 +852,15 @@ relies only on blockDim.x block.x and thread.x"
   (copy-host->device [stream host-buffer host-offset device-buffer device-offset elem-count]
     (generalized-cuda-async-copy stream host-buffer host-offset device-buffer device-offset
                                  elem-count cuda/cudaMemcpyHostToDevice))
+
   (copy-device->host [stream device-buffer device-offset host-buffer host-offset elem-count]
     (generalized-cuda-async-copy stream device-buffer device-offset host-buffer host-offset
                                  elem-count cuda/cudaMemcpyDeviceToHost))
+
   (copy-device->device [stream src-buffer src-offset dest-buffer dest-offset elem-count]
     (generalized-cuda-async-copy stream src-buffer src-offset dest-buffer dest-offset
                                  elem-count cuda/cudaMemcpyDeviceToDevice))
+
   (memset [stream device-buffer device-offset elem-val elem-count]
     (when (> (long elem-count) 0)
      (let [buf-dtype (dtype/get-datatype device-buffer)
@@ -857,9 +878,11 @@ relies only on blockDim.x block.x and thread.x"
     (let [retval (cuda-event)]
       (cuda-call (cuda/cudaEventRecord retval (.stream stream)))
       (resource/track retval)))
+
   ;;Ensure this stream cannot proceed until this event is triggered.
   (sync-event [stream ^cuda$CUevent_st event]
     (cuda-call (cuda/cudaStreamWaitEvent (.stream stream) event (int 0))))
+
   (indexed-copy-impl [stream src src-indexes src-stride
                       dst dst-indexes dst-stride n-elems-per-index]
     (let [n-indexes (m/ecount src-indexes)]
@@ -884,6 +907,7 @@ relies only on blockDim.x block.x and thread.x"
                               (->ptr src) (->ptr src-indexes) (int src-stride)
                               (->ptr dst) (->ptr dst-indexes) (int dst-stride)
                               (int n-elems-per-index) (int n-indexes)))))
+
   math/PMath
   (gemm-impl [stream trans-a? trans-b?
               a-row-count a-col-count b-col-count
@@ -1032,8 +1056,5 @@ relies only on blockDim.x block.x and thread.x"
 (extend-type cuda$CUevent_st
   drv/PEvent
   (wait-for-event [evt]
-    (cuda/cudaEventSynchronize evt))
-  resource/PResource
-  (release-resource [evt]
-    ;;Produces unknown cuda error
-    (comment (cuda-call (cuda/cudaEventDestroy evt)))))
+    (cuda/cudaEventSynchronize evt)))
+

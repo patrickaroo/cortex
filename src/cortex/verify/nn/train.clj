@@ -125,7 +125,7 @@
         as bs)))
 
 (defn test-corn
-  [& [context]]
+  [context]
   (let [dataset CORN-DATASET
         labels (map :label dataset)
         big-dataset (apply concat (repeat 2000 dataset))

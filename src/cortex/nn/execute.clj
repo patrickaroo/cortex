@@ -9,9 +9,10 @@ a transformation from compute-graph -> compute-graph via some training process.
 Both train and infer should be wrapped in resource contexts; this is not done at this level.
 Furthermore infer should be both wrapped in a resource context and completely realized."
   (:require
-    [clojure.pprint :as pprint]
+    [clojure.core.async :as async]
     [clojure.core.matrix :as m]
     [clojure.set :as c-set]
+    [clojure.pprint :as pprint]
     [clojure.core.matrix.macros :refer [c-for]]
     [think.resource.core :as resource]
     [think.datatype.core :as dtype]
@@ -28,6 +29,8 @@ Furthermore infer should be both wrapped in a resource context and completely re
     [cortex.compute.math :as math]
     [cortex.compute.loss :as compute-loss]
     [cortex.compute.cpu.backend :as cpu]
+    [cortex.compute.cuda.driver :as cuda-driver]
+    [cortex.compute.cpu.driver :as cpu-driver]
     [cortex.compute.nn.layers :as compute-layers]
     [cortex.compute.nn.backend :as backend]
     [cortex.compute.nn.protocols :as compute-protocols]))
@@ -585,6 +588,7 @@ Furthermore infer should be both wrapped in a resource context and completely re
                      (math/device-buffer weight-magnitude-temp) 1
                      (math/device-buffer buffer) num-w-cols))))
 
+
 (defn- optimize-network
   [network]
   (let [parameters (network/parameters network)
@@ -930,7 +934,7 @@ any loss-specific parameter buffers."
   [k]
   (and (map? k) (:stream k) (:augmentation k)))
 
-;; TODO: can we get rid of required keys here by pre-filtering the dataset (from the traversal leaves)?
+
 (defn batch-buffers
   [network batch training?]
   (let [driver (network/driver network)
@@ -945,12 +949,13 @@ any loss-specific parameter buffers."
     (when (zero? (count required-keys))
       (throw (ex-info "Zero required keys in batch-buffers" {})))
     (->> (for [k required-keys]
-           (let [[data datatype] (if (map? k)
-                                   (let [augmented-stream-val (get batch k)]
-                                     (if (map? augmented-stream-val)
-                                       [(:data augmented-stream-val) (:datatype augmented-stream-val)]
-                                       [augmented-stream-val datatype]))
-                                   [(get batch k) datatype])
+           (let [[data datatype]
+                 (if (map? k)
+                   (let [augmented-stream-val (get batch k)]
+                     (if (map? augmented-stream-val)
+                       [(:data augmented-stream-val) (:datatype augmented-stream-val)]
+                       [augmented-stream-val datatype]))
+                   [(get batch k) datatype])
                  _ (when (nil? data)
                      (throw (ex-info "Dataset batch missing key" {:key k})))
                  data-size (long (m/ecount data))
@@ -973,8 +978,11 @@ any loss-specific parameter buffers."
          (into {}))))
 
 
+; TODO: load-batch! needs to take a stream and do the copy
+; asynchronously
 (defn load-batch!
-  [network batch batch-buffers]
+  "Copy a batch of data into a set of batch buffers on the compute device."
+  [stream batch batch-buffers]
   (doseq [[k {:keys [device-array host-buffer]}] batch-buffers]
     (let [data (get batch k)
           data (if (map? data) (:data data) data)
@@ -983,7 +991,7 @@ any loss-specific parameter buffers."
         (throw (ex-info "Failed to load-batch!"
                         {:item-count item-count
                          :buffer-size (m/ecount host-buffer)}))))
-    (drv/copy-host->device (network/stream network)
+    (drv/copy-host->device stream
                            host-buffer 0
                            (math/device-buffer device-array) 0
                            (m/ecount host-buffer))))
@@ -1029,11 +1037,35 @@ any loss-specific parameter buffers."
       (network/output-bindings network))))
 
 
+(defn batch-loader
+  [stream batches batch-buffers]
+  (let [driver (drv/get-driver stream)
+        device (drv/get-current-device driver)
+        n (count batch-buffers)
+        loaded-chan (async/chan n)
+        free-chan (async/chan n)
+        buf-events (mapv vector batch-buffers (repeatedly #(drv/create-event stream)))]
+    (async/onto-chan free-chan buf-events false)
+    (resource/with-resource-context
+      (async/go
+        (loop [batches batches]
+          (drv/set-current-device driver device)
+          (if-let [next-batch (first batches)]
+            (let [[next-bufs event] (async/<! free-chan)]
+              (drv/wait-for-event event)
+              (load-batch! stream next-batch next-bufs)
+              (async/>! loaded-chan [next-bufs (drv/create-event stream)])
+              (recur (next batches)))
+            (async/close! loaded-chan)))))
+    [loaded-chan free-chan]))
+
+
 (defn train
   [network dataset &
-   {:keys [batch-size context optimizer datatype]
+   {:keys [batch-size context optimizer datatype n-buffers]
     :or {batch-size 10
-         datatype :double}}]
+         datatype :double
+         n-buffers 1}}]
   (resource/with-resource-context
     (let [optimizer (or optimizer (adam/adam))
           context (or context (compute-context :datatype datatype))
@@ -1047,20 +1079,40 @@ any loss-specific parameter buffers."
           batches (->> (dataset-batches dataset batch-size)
                        (map (partial graph/augment-streams (network/network->graph network))))
           network (add-pass-to-network network {} :backward)
-          batch-buffers (batch-buffers network (first batches) true)
+
+          mem-info (if (= :cuda (:substrate context))
+                     (cuda-driver/get-memory-info)
+                     (cpu-driver/get-memory-info))
+          ;batch-buffer-size ...
+          ;n-buffers (/ (:free mem-info) batch-buffer-size
+          batch-buffers (take n-buffers
+                              (repeatedly
+                                #(batch-buffers network (first batches) true)))
           stream (network/stream network)
-          stream->buffer-map (zipmap (keys batch-buffers)
-                                     (map :device-array (vals batch-buffers)))
-          network (assoc-in network [:compute-binding :stream->buffer-map]
-                            stream->buffer-map)]
-      (doseq [batch batches]
-        (load-batch! network batch batch-buffers)
-        (-> network
-            (do-traverse stream->buffer-map :forward)
-            (zero-traverse-gradients)
-            (compute-loss-term-gradients)
-            (do-traverse {} :backward)
-            (optimize-network)))
+          [loaded-chan free-chan] (batch-loader stream batches batch-buffers)
+      ;; TODO: Change the stream->buffer-map structure a bit so we don't need to
+      ; keep mapping over the batch-buffers and associng to the network.
+      processor
+      (async/go-loop []
+        (when-let [[batch-buffers ready-event] (async/<! loaded-chan)]
+          (drv/wait-for-event ready-event)
+          (let [stream->buffer-map (zipmap (keys batch-buffers)
+                                           (map :device-array (vals batch-buffers)))
+                network (-> network
+                            (assoc-in [:compute-binding :stream->buffer-map]
+                                      stream->buffer-map)
+                            (do-traverse stream->buffer-map :forward)
+                            (zero-traverse-gradients)
+                            (compute-loss-term-gradients)
+                            (do-traverse {} :backward)
+                            (optimize-network))
+                event (drv/create-event stream)]
+            (async/>!! free-chan [batch-buffers event])
+            (recur))))]
+      (async/close! free-chan)
+      ; TODO: add an async option where this returns a channel that will receive
+      ; the trained network (or a sequence of them).
+      (async/<!! processor)
       (save-to-network context network {}))))
 
 
@@ -1084,8 +1136,9 @@ any loss-specific parameter buffers."
           batches (->> (dataset-batches dataset batch-size)
                        (map (partial graph/augment-streams (network/network->graph network))))
           _ (when (empty? batches)
-              (throw (ex-info "Batches were empty, perhaps batch-size > (count dataset)?")))
+              (throw (ex-info "Batches were empty, perhaps batch-size > (count dataset)?" {})))
           batch-buffers (batch-buffers network (first batches) false)
+          stream (network/stream network)
           stream->buffer-map (zipmap (keys batch-buffers)
                                      (map :device-array (vals batch-buffers)))
           network (assoc-in network
@@ -1094,9 +1147,7 @@ any loss-specific parameter buffers."
           output-buffers (output-binding-buffers network batch-size datatype)]
       (reduce
        (fn [results next-batch]
-         (load-batch! network next-batch batch-buffers)
-         ;; (println "\nTraversal:")
-         ;; (clojure.pprint/pprint (get-in network [:traversal :forward]))
+         (load-batch! stream next-batch batch-buffers)
          (do-traverse network stream->buffer-map :inference)
          (concat results (network/output-values network output-buffers)))
        []
