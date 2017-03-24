@@ -96,8 +96,8 @@ Download the CUDA Deep Neural Network [libraries](https://developer.nvidia.com/c
 Once downloaded and unzipped, moving the files:
 
     $ sudo mv include/cudnn.h /Developer/NVIDIA/CUDA-8.0/include/
-    $ sudo mv lib/libcudnn* /Developer/NVIDIA/CUDA-8.0/lib
-    $ sudo ln -s /Developer/NVIDIA/CUDA-8.0/lib/libcudnn* /usr/local/cuda/lib/
+    $ sudo mv -v cuda/lib/libcudnn* /usr/local/cuda/lib
+    $ sudo mv -v cuda/include/cudnn.h /usr/local/cuda/include
 
 Should you see a jni linking error similar to this
 
